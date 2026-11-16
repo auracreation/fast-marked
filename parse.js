@@ -20,12 +20,21 @@ const WS_RE = /\s/;
 const TAGNAMES = 'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
 
 function escEncode(s) {
-  return s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0
-    ? s : s.replace(ESC_RE, (c) => ESC_MAP[c]);
+  return ESC_ANY_RE.test(s) ? s.replace(ESC_RE, (c) => ESC_MAP[c]) : s;
 }
+const ESC_ANY_RE = /[<>"'&]/;
 function escNoEncode(s) {
-  return s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0 && s.indexOf('&') < 0
-    ? s : s.replace(ESC_NOENC_RE, (c) => ESC_MAP[c] || '&amp;');
+  // one regex test replaces five indexOf scans; chunks are short
+  return ESC_ANY_RE.test(s) ? s.replace(ESC_NOENC_RE, (c) => ESC_MAP[c] || '&amp;') : s;
+}
+// Fused text-chunk escape: chunks from scanText never contain '<'
+// (it is a scan special), so only &, > " ' can need work. One regex
+// test replaces decodeNumeric's '&' check plus escNoEncode's five
+// indexOf scans on the common no-entity chunk.
+const ESC_TEXT_RE = /[&>"']/;
+function escText(s) {
+  if (!ESC_TEXT_RE.test(s)) return s;
+  return escNoEncode(decodeNumeric(s));
 }
 function decodeNumeric(s) {
   if (s.indexOf('&') < 0) return s;
@@ -39,7 +48,9 @@ function decodeNumeric(s) {
   });
 }
 function cleanUrl(href) {
-  try { return encodeURI(href).replace(/%25/g, '%'); } catch { return null; }
+  // encodeURI only produces %25 by encoding a '%' from the input, so
+  // when the input holds no '%' the replace is a no-op scan; skip it
+  try { const e = encodeURI(href); return href.indexOf('%') < 0 ? e : e.replace(/%25/g, '%'); } catch { return null; }
 }
 function normLabel(label) {
   return label.trim().replace(/\s+/g, ' ').toLowerCase().toUpperCase().toLowerCase();
@@ -216,13 +227,21 @@ function consumedLines(raw) {
   const nl = (raw.match(/\n/g) || []).length;
   return raw.endsWith('\n') ? nl : nl + 1;
 }
+// leadCount runs on nearly every line several times (bullet, heading,
+// hr, fence and blockquote checks each call it), and every call used
+// to allocate a fresh {col, idx} object. All callers read the values
+// immediately (or call it again on the same line, which yields the
+// same values), so one shared result object is exact here and cuts
+// thousands of small allocations per document.
+const LEAD = { col: 0, idx: 0 };
 function leadCount(s) {
   let i = 0, col = 0;
   while (i < s.length && (s[i] === ' ' || s[i] === '\t')) {
     if (s[i] === '\t') col += 4 - (col % 4); else col++;
     i++;
   }
-  return { col, idx: i };
+  LEAD.col = col; LEAD.idx = i;
+  return LEAD;
 }
 function isHrLine(s) {
   const { col, idx } = leadCount(s);
@@ -295,6 +314,11 @@ function tableDelim(s) {
 }
 function isTableStart(lines, i) {
   if (i + 1 >= lines.length) return false;
+  // a table delimiter always contains '-'; most lines' next line does
+  // not, so this cheap check skips the delimiter regex (and the
+  // header split) for nearly every paragraph line
+  const dl = lines[i + 1];
+  if (!dl || dl.indexOf('-') < 0) return false;
   const head = lines[i];
   if (!head || head.trim() === '' || head[0] === ' ') {
     // header may have leading spaces; the table regex allows ' *' before it
@@ -789,13 +813,27 @@ function listLineBreaks(s, res, effIndent, includeBq) {
   return false;
 }
 
+// The item regex is compiled once per list; only five variants exist
+// (unordered -, *, + and ordered '.' / ')'), so cache them instead of
+// paying a RegExp compile for every list in the document.
+const itemReCache = new Map();
+function itemReFor(ordered, bull, delim) {
+  const key = ordered ? 'o' + delim : 'u' + bull;
+  let r = itemReCache.get(key);
+  if (!r) {
+    const bullPat = ordered ? `\\d{1,9}\\${delim}` : `\\${bull}`;
+    r = new RegExp(`^( {0,3}${bullPat})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
+    itemReCache.set(key, r);
+  }
+  return r;
+}
+
 function parseList(lines, i, b, links) {
   const first = bulletOf(lines[i]);
   if (!first) return null;
   const ordered = first.ordered;
   const startNum = ordered ? first.num : 0;
-  const bullPat = ordered ? `\\d{1,9}\\${first.delim}` : `\\${first.bull}`;
-  const itemRe = new RegExp(`^( {0,3}${bullPat})((?:[\\t ][^\\n]*)?(?:\\n|$))`);
+  const itemRe = itemReFor(ordered, first.bull, first.delim);
   const items = [];
   let loose = false;
   let endsBlank = false;
@@ -887,7 +925,10 @@ function parseList(lines, i, b, links) {
       if (endsBlank) loose = true;
       else if (cur > itemStartLine && blankLine(lines[cur - 1])) endsBlank = true;
     }
-    items.push({ text: itemParts.join('\n'), task: false, nodes: null, checked: false });
+    // keep the lines as an array: joining them here only to split
+    // them again in the tokenize loop below is a wasted round-trip
+    // per item (6,958 items in the practice docs)
+    items.push({ parts: itemParts, task: false, nodes: null, checked: false });
     j = cur;
     listRawLines = j - i;
     if (j >= b) break;
@@ -899,12 +940,19 @@ function parseList(lines, i, b, links) {
   }
   if (!items.length) return null;
   const lastItem = items[items.length - 1];
-  lastItem.text = lastItem.text.trimEnd();
+  // trimEnd on the joined text: drop trailing whitespace-only parts,
+  // then trim the trailing whitespace of the last remaining part
+  {
+    const p = lastItem.parts;
+    while (p.length && blankLine(p[p.length - 1])) p.pop();
+    if (p.length) p[p.length - 1] = p[p.length - 1].trimEnd();
+  }
   // tokenize items
   for (const item of items) {
-    const sub = item.text.split('\n');
-    item.nodes = parseLines(sub, 0, sub.length, 'text', links);
-    item.task = /^\[[ xX]\][ \t]+\S/.test(item.text);
+    item.nodes = parseLines(item.parts, 0, item.parts.length, 'text', links);
+    // the task marker can only match at the very start, so only the
+    // first part can match (the regex cannot span the '\n')
+    item.task = item.parts.length > 0 && /^\[[ xX]\][ \t]+\S/.test(item.parts[0]);
     if (!loose && item.nodes.hasBlankSep) loose = true;
   }
   // task checkboxes
@@ -958,8 +1006,14 @@ const RE_DEL_R = new RegExp(
 const RE_EM_L_Y = stickyOf(RE_EM_L);
 const RE_DEL_L_Y = stickyOf(RE_DEL_L);
 const RE_REFLINK_SEARCH = /!?\[(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\`])*\\]|\\[\s\S]|[^\[\]\\`])*?\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\`]){1,999})\]|!?\[(?:(?!\s*\])(?:\\[\s\S]|[^\[\]\\`]){1,999})\](?:\[\])?(?!\\\()/g;
-const RE_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
-const RE_ANYPUNCT_OUTSIDE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+// Fused anypunct + blockskip pass (see maskSrc): one scan and one
+// string build instead of two. Alternatives in order: anypunct code
+// span, escaped punct, lone backtick run, blockskip inline link
+// (its label code spans use anypunct's code pattern, not
+// blockskip's [^`]+, because anypunct '+'-es inner backticks
+// before blockskip runs -- a label code span with an inner backtick
+// must still match the link, as it does after that '+'-ing), tag.
+const RE_MASK23 = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|\\([\p{P}\p{S}])|`+|\[(?:[^\[\]`]|(?<a>`+)(?:[^`]|[^`][\s\S]*?[^`])\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|<(?! )[^<>]*?>/gu;
 
 const MASK_NEEDED_RE = /[\[`<\\]/;
 function maskSrc(src, links) {
@@ -993,20 +1047,51 @@ function maskSrc(src, links) {
     RE_REFLINK_SEARCH.lastIndex = 0;
     masked = masked.replace(RE_REFLINK_SEARCH, maskReflink);
   }
-  // RE_ANYPUNCT_OUTSIDE only matches code spans (`) or escaped punct (\\):
-  // with neither present the replace is a no-op scan of the whole string
-  if (masked.indexOf('`') >= 0 || masked.indexOf('\\') >= 0) {
-    masked = masked.replace(RE_ANYPUNCT_OUTSIDE, (m0, code, punct) => {
-      if (punct) return '+'.repeat(m0.length);
-      if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-      return m0;
-    });
-  }
-  // RE_BLOCKSKIP only matches '[...](...)', code spans or '<...>' tags
-  if (masked.indexOf('[') >= 0 || masked.indexOf('`') >= 0 || masked.indexOf('<') >= 0) {
-    masked = masked.replace(RE_BLOCKSKIP, (m0, _l, ctx) => {
-      const off = ctx ? ctx.length : 0;
-      return m0.slice(0, off) + '[' + 'a'.repeat(Math.max(0, m0.length - off - 2)) + ']';
+  // Fused anypunct + blockskip pass: the two replaces ran in
+  // sequence (anypunct first), each with its own scan and string
+  // build. One combined replace does both, because the passes are
+  // length-preserving and their replacements never introduce a
+  // construct either looks for -- except for two interactions,
+  // handled here:
+  //  - a code span is masked to '[aaa]' by blockskip UNLESS
+  //    blockskip's (?<!`) lookbehind blocks it (a backtick
+  //    immediately before the span in the ANYPUNCT output), in
+  //    which case it keeps anypunct's own result. The char before
+  //    the span in that output is a backtick exactly when it is
+  //    one in the input and was not covered by an earlier match,
+  //    or when the previous match ended right here and was a code
+  //    span or a lone backtick run (whose last char stays '`' in
+  //    the anypunct output; a '[aaa]' or '++' replacement ends in
+  //    ']' or '+').
+  //  - a link whose label holds a code span with an inner backtick
+  //    is matched by blockskip only after anypunct '+'-es that
+  //    backtick, so the fused link pattern allows inner backticks
+  //    in label code spans (RE_MASK23 above).
+  if (masked.indexOf('`') >= 0 || masked.indexOf('\\') >= 0 || masked.indexOf('[') >= 0 || masked.indexOf('<') >= 0) {
+    let lastEnd = 0, lastCodeOrLone = false;
+    masked = masked.replace(RE_MASK23, (m0, code, punct, _a, offset, str) => {
+      let rep;
+      if (punct) {
+        rep = '+'.repeat(m0.length);
+        lastEnd = offset + m0.length; lastCodeOrLone = false;
+        return rep;
+      }
+      if (code) {
+        const prevBacktick = offset > 0 && (offset === lastEnd ? lastCodeOrLone : str[offset - 1] === '`');
+        if (prevBacktick) rep = code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+        else rep = '[' + 'a'.repeat(Math.max(0, m0.length - 2)) + ']';
+        lastEnd = offset + m0.length; lastCodeOrLone = true;
+        return rep;
+      }
+      if (m0[0] === '`') {
+        // lone backtick run: anypunct leaves it unchanged
+        lastEnd = offset + m0.length; lastCodeOrLone = true;
+        return m0;
+      }
+      // inline link or tag: blockskip masks the whole match
+      rep = '[' + 'a'.repeat(Math.max(0, m0.length - 2)) + ']';
+      lastEnd = offset + m0.length; lastCodeOrLone = false;
+      return rep;
     });
   }
   return masked;
@@ -1033,27 +1118,15 @@ function lastClosers(masked) {
   }
   return { star, und, tilde };
 }
-function lastCloserCached(ctx, masked, delim) {
-  if (ctx._lcMask !== masked) {
-    ctx._lcMask = masked;
-    ctx._lc = lastClosers(masked);
-  }
-  return delim === '*' ? ctx._lc.star : delim === '_' ? ctx._lc.und : ctx._lc.tilde;
-}
-function lastCloserIndex(masked, delim) {
-  let last = -1;
-  for (let i = 0; i < masked.length; i++) {
-    const ch = masked[i];
-    if (ch !== '*' && ch !== '_' && ch !== '~') continue;
-    const prev = i === 0 ? '\n' : masked[i - 1];
-    let j = i + 1;
-    while (j < masked.length && masked[j] === ch) j++;
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      if (delim === '~' ? ch === '~' : ch === delim) last = i;
-    }
-    i = j - 1;
-  }
-  return last;
+// Last-closer cache owned by one inlineRender invocation: the old
+// version cached on the shared ctx, so a nested inlineRender (link
+// text) overwrote it and the outer call re-scanned -- and the
+// string-identity check could degrade into a full O(n) content
+// comparison when the two masked strings merely shared a length.
+// An object created per invocation is compared by identity only.
+function lastCloserFor(lcObj, delim) {
+  if (!lcObj.lc) lcObj.lc = lastClosers(lcObj.masked);
+  return delim === '*' ? lcObj.lc.star : delim === '_' ? lcObj.lc.und : lcObj.lc.tilde;
 }
 
 // Inline rendering context, shared across one inline run.
@@ -1074,6 +1147,7 @@ function inlineRender(src, links, ctx, plain) {
     return escNoEncode(decodeNumeric(src));
   }
   const masked = (src.indexOf('*') >= 0 || src.indexOf('_') >= 0 || src.indexOf('~') >= 0) ? maskSrc(src, links) : src;
+  const lcObj = { masked, lc: null };
   const prevParen = ctx.parenPossible;
   ctx.parenPossible = prevParen && src.indexOf(')') >= 0;
   let out = '';
@@ -1123,7 +1197,7 @@ function inlineRender(src, links, ctx, plain) {
     }
     // emphasis / strong
     if (ch === '*' || ch === '_') {
-      const r = tryEmphasis(src, i, masked, links, ctx, plain);
+      const r = tryEmphasis(src, i, masked, links, ctx, plain, lcObj);
       if (r) { out += r.html; i += r.len; continue; }
     }
     // code span
@@ -1148,7 +1222,7 @@ function inlineRender(src, links, ctx, plain) {
     }
     // strikethrough
     if (ch === '~') {
-      const r = tryDel(src, i, masked, links, ctx, plain);
+      const r = tryDel(src, i, masked, links, ctx, plain, lcObj);
       if (r) { out += r.html; i += r.len; continue; }
     }
     // autolink
@@ -1204,7 +1278,7 @@ function inlineRender(src, links, ctx, plain) {
     const chunk = src.slice(start, i);
     if (plain) out += chunk;
     else if (ctx.inRawBlock) out += chunk;
-    else out += escNoEncode(decodeNumeric(chunk));
+    else out += escText(chunk);
   }
   ctx.parenPossible = prevParen;
   return out;
@@ -1287,6 +1361,9 @@ function scanText(s, i, ctx, plain) {
   // slice instead of the whole remainder is exact and far shorter.
   // (Email is different: its word can start before `end` while its
   // '@' lies past it, so it still searches the full string below.)
+  // NOTE: the slice is a V8 SlicedString view, not a copy, and the
+  // searches stay bounded to the chunk; running them on the source
+  // string instead scans the whole remainder and measured slower.
   const sub = s.slice(j, end);
   let q = sub.indexOf('  \n');
   if (q !== -1) {
@@ -1454,7 +1531,7 @@ function runCpLenMinus1(s) {
   return n - 1;
 }
 
-function tryEmphasis(src, i, masked, links, ctx, plain) {
+function tryEmphasis(src, i, masked, links, ctx, plain, lcObj) {
   const match = execAt(RE_EM_L_Y, src, i);
   if (!match) return null;
   if (!match[1] && !match[2] && !match[3] && !match[4]) return null;
@@ -1475,7 +1552,7 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
   const runLen = srcStart - runStart + lLen;
   const openerCanClose = !!runPrev.trim() && (!!nextChar || (delim === '*' && !runPrevPunct));
   const endRe = delim === '*' ? RE_EM_R_AST : RE_EM_R_UND;
-  const lastIdx = lastCloserCached(ctx, masked, delim);
+  const lastIdx = lastCloserFor(lcObj, delim);
   const windowStart = i + lLen;
   if (lastIdx < windowStart) return null;
   const windowMasked = masked.slice(windowStart);
@@ -1509,7 +1586,7 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
   return null;
 }
 
-function tryDel(src, i, masked, links, ctx, plain) {
+function tryDel(src, i, masked, links, ctx, plain, lcObj) {
   const match = execAt(RE_DEL_L_Y, src, i);
   if (!match) return null;
   const nextChar = match[1] || '';
@@ -1517,7 +1594,7 @@ function tryDel(src, i, masked, links, ctx, plain) {
   if (!nextChar || !prevChar || isPunct(prevChar)) {
     const lLen = runCpLenMinus1(match[0]);
     let delimTotal = lLen;
-    const lastIdx = lastCloserCached(ctx, masked, '~');
+    const lastIdx = lastCloserFor(lcObj, '~');
     const windowStart = i + lLen;
     if (lastIdx < windowStart) return null;
     const windowMasked = masked.slice(windowStart);
@@ -1575,43 +1652,49 @@ function renderNodes(nodes, links, out, ctx) {
       }
       case 'html': out.push(node.text); break;
       case 'bq': {
-        const inner = [];
-        renderNodes(node.nodes, links, inner, ctx);
-        out.push('<blockquote>\n', inner.join(''), '</blockquote>\n');
+        // flattened: push straight into the caller's array instead
+        // of building and joining an intermediate one
+        out.push('<blockquote>\n');
+        renderNodes(node.nodes, links, out, ctx);
+        out.push('</blockquote>\n');
         break;
       }
       case 'list': {
-        const body = [];
-        for (const item of node.items) body.push(renderListItem(item, node.loose, links, ctx));
         const type = node.ordered ? 'ol' : 'ul';
         const startAttr = node.ordered && node.start !== 1 && node.start !== '' ? ' start="' + node.start + '"' : '';
-        out.push('<', type, startAttr, '>\n', body.join(''), '</', type, '>\n');
+        out.push('<', type, startAttr, '>\n');
+        for (const item of node.items) renderListItem(item, node.loose, links, ctx, out);
+        out.push('</', type, '>\n');
         break;
       }
       case 'table': {
-        const headerParts = [];
+        out.push('<table>\n<thead>\n<tr>\n');
         for (let j = 0; j < node.header.length; j++) {
           const cell = node.header[j];
           const align = node.align[j];
-          headerParts.push('<th' + (align ? ' align="' + align + '"' : '') + '>' + entryRender(cell, links, ctx) + '</th>\n');
+          out.push('<th' + (align ? ' align="' + align + '"' : '') + '>' + entryRender(cell, links, ctx) + '</th>\n');
         }
-        const bodyParts = [];
-        for (const row of node.rows) {
-          const cells = splitCells(row, node.header.length);
-          const rowParts = [];
-          for (let k = 0; k < cells.length; k++) {
-            const align = node.align[k];
-            rowParts.push('<td' + (align ? ' align="' + align + '"' : '') + '>' + entryRender(cells[k], links, ctx) + '</td>\n');
+        out.push('</tr>\n</thead>\n');
+        if (node.rows.length) {
+          out.push('<tbody>');
+          for (const row of node.rows) {
+            const cells = splitCells(row, node.header.length);
+            out.push('<tr>\n');
+            for (let k = 0; k < cells.length; k++) {
+              const align = node.align[k];
+              out.push('<td' + (align ? ' align="' + align + '"' : '') + '>' + entryRender(cells[k], links, ctx) + '</td>\n');
+            }
+            out.push('</tr>\n');
           }
-          bodyParts.push('<tr>\n' + rowParts.join('') + '</tr>\n');
+          out.push('</tbody>');
         }
-        out.push('<table>\n<thead>\n<tr>\n', headerParts.join(''), '</tr>\n</thead>\n', bodyParts.length ? '<tbody>' + bodyParts.join('') + '</tbody>' : '', '</table>\n');
+        out.push('</table>\n');
         break;
       }
     }
   }
 }
-function renderListItem(item, loose, links, ctx) {
+function renderListItem(item, loose, links, ctx, out) {
   const nodes = item.nodes.slice();
   let prefix = '';
   if (nodes.length && nodes[0].k === 'cb') {
@@ -1624,20 +1707,21 @@ function renderListItem(item, loose, links, ctx) {
       renderNodes([first], links, inner, ctx);
       // renderNodes wrapped it in <p>...</p>; inject the checkbox after <p>
       const html = inner.join('');
-      const rest = nodes.slice(1);
-      const tail = [];
-      renderNodes(rest, links, tail, ctx);
-      return '<li>' + html.replace('<p>', '<p>' + prefix) + tail.join('') + '</li>\n';
+      out.push('<li>' + html.replace('<p>', '<p>' + prefix));
+      renderNodes(nodes.slice(1), links, out, ctx);
+      out.push('</li>\n');
+      return;
     }
     if (!loose) {
-      const tail = [];
-      renderNodes(nodes, links, tail, ctx);
-      return '<li>' + prefix + tail.join('') + '</li>\n';
+      out.push('<li>' + prefix);
+      renderNodes(nodes, links, out, ctx);
+      out.push('</li>\n');
+      return;
     }
   }
-  const body = [];
-  renderNodes(nodes, links, body, ctx);
-  return '<li>' + body.join('') + '</li>\n';
+  out.push('<li>');
+  renderNodes(nodes, links, out, ctx);
+  out.push('</li>\n');
 }
 
 export function parse(markdown) {
