@@ -583,7 +583,17 @@ function parseLines(lines, a, b, mode, links, nodes = [], mergeParagraphs = fals
       continue;
     }
     const remaining = getRest();
-    const heading = RE_LHEADING.exec(remaining);
+    // Setext headings are rare, but RE_LHEADING is a heavy backtracking
+    // regex run over the whole remainder on every paragraph. It can only
+    // match when a later line of this paragraph block (before the next
+    // blank line) is a setext underline, so skip it unless one exists.
+    let maybeSetext = false;
+    for (let k = i + 1; k < b; k++) {
+      const lk = lines[k];
+      if (blankLine(lk)) break;
+      if (RE_SETEXT.test(lk)) { maybeSetext = true; break; }
+    }
+    const heading = maybeSetext ? RE_LHEADING.exec(remaining) : null;
     if (heading) {
       nodes.push({ k: 'h', d: heading[2][0] === '=' ? 1 : 2, text: heading[1].trim() });
       i += consumedLines(rtrimStr(heading[0], '\n'));
