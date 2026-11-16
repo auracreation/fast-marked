@@ -90,8 +90,22 @@ function expandTabs(line, indent = 0) {
   }
   return out;
 }
-function isPunct(ch) { return ch.length === 1 && /[\s\p{P}\p{S}]/u.test(ch); }
-function isAlnum(ch) { return ch.length === 1 && ALNUM_RE.test(ch); }
+const IS_PUNCT_RE = /[\s\p{P}\p{S}]/u;
+function isPunct(ch) {
+  if (ch.length !== 1) return false;
+  const c = ch.charCodeAt(0);
+  if (c < 128) {
+    return (c >= 33 && c <= 47) || (c >= 58 && c <= 64) || (c >= 91 && c <= 96) || (c >= 123 && c <= 126)
+      || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32;
+  }
+  return IS_PUNCT_RE.test(ch);
+}
+function isAlnum(ch) {
+  if (ch.length !== 1) return false;
+  const c = ch.charCodeAt(0);
+  if (c < 128) return (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  return ALNUM_RE.test(ch);
+}
 
 // ---- block patterns ----
 const RE_NEWLINE = /^(?:[ \t]*(?:\n|$))+/;
@@ -149,7 +163,10 @@ function stickyOf(re) {
     if (c === '^' && !inClass && (k === 0 || src[k - 1] === '|' || src[k - 1] === '(')) continue;
     out += c;
   }
-  return new RegExp(out, 'y');
+  // keep the source regex's flags (notably 'u' for \p{...} patterns),
+  // replacing 'g' with sticky 'y' so execAt matches at the offset
+  // without slicing the remaining source first
+  return new RegExp(out, re.flags.replace('g', '') + 'y');
 }
 function execAt(re, s, i) {
   re.lastIndex = i;
@@ -161,9 +178,39 @@ const RE_BR_Y = stickyOf(RE_BR);
 const RE_AUTOLINK_Y = stickyOf(RE_AUTOLINK);
 const RE_TAG_Y = stickyOf(RE_TAG);
 const RE_URL_Y = stickyOf(RE_URL);
+const RE_LINK_Y = stickyOf(RE_LINK);
+const RE_REFLINK_Y = stickyOf(RE_REFLINK);
+const RE_NOLINK_Y = stickyOf(RE_NOLINK);
 
 // ---- block helpers (line based) ----
-function blankLine(s) { return /^[ \t]*$/.test(s); }
+function blankLine(s) {
+  // the old /^[ \t]*$/ test coerced non-strings (undefined lines past
+  // the end of a section, as parseList can pass) to "undefined"/"null"
+  // and returned false; keep that behaviour instead of throwing
+  if (typeof s !== 'string') return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+// /^(?: {4}[^\n]| {0,3}\t)/ as char checks: the same test runs on
+// every line of parseLines/collectPara, and a regex setup per line is
+// slower than a few charCodeAt comparisons. Lines handed here are
+// newline-free, so the {4} arm needs no fifth-character check beyond
+// the line being non-blank (callers already ensure that, or check
+// blankLine alongside).
+function isIndentCodeStart(line) {
+  if (typeof line !== 'string') return false;
+  if (line.charCodeAt(0) === 9) return true;
+  if (line.charCodeAt(0) !== 32) return false;
+  if (line.charCodeAt(1) === 9) return true;
+  if (line.charCodeAt(1) !== 32) return false;
+  if (line.charCodeAt(2) === 9) return true;
+  if (line.charCodeAt(2) !== 32) return false;
+  if (line.charCodeAt(3) === 9) return true;
+  return line.charCodeAt(3) === 32;
+}
 function consumedLines(raw) {
   if (!raw) return 0;
   const nl = (raw.match(/\n/g) || []).length;
@@ -301,7 +348,7 @@ function collectPara(lines, i, end, mode) {
     // text with its indent stripped, as marked does by merging an
     // indented code block into the open text token; lines with fewer
     // spaces are not code blocks and keep their indent verbatim
-    if (mode === 'text' && j > i && /^(?: {4}[^\n]| {0,3}\t)/.test(line)) {
+    if (mode === 'text' && j > i && isIndentCodeStart(line)) {
       out.push(line.replace(/^(?: {0,3}\t| {1,4})/, '')); j++; continue;
     }
     out.push(line);
@@ -323,6 +370,19 @@ function parseLines(lines, a, b, mode, links) {
   let prevHadBlank = false;
   let prevNodeCount = 0;
   let i = a;
+  // Joined-lines cache for getRest (see below); hoisted out of the loop
+  // so it survives across lines, built lazily on first use.
+  let joinedCache = null, offsetCache = null;
+  const getJoined = () => {
+    if (joinedCache === null) {
+      joinedCache = lines.slice(a, b).join('\n');
+      offsetCache = new Array(b - a + 1);
+      let o = 0;
+      for (let k = a; k < b; k++) { offsetCache[k - a] = o; o += lines[k].length + 1; }
+      offsetCache[b - a] = o;
+    }
+    return joinedCache;
+  };
   while (i < b) {
     let skippedBlanks = 0;
     while (i < b && blankLine(lines[i])) { if (nodes.length) skippedBlanks++; i++; }
@@ -339,18 +399,22 @@ function parseLines(lines, a, b, mode, links) {
     prevNodeCount = nodes.length;
     // the remaining source as one string is only built when a block that
     // needs it can start here (indented code, fence, html block, def);
-    // building it on every line is quadratic on long documents
-    let rest = null;
-    const getRest = () => (rest ??= lines.slice(i, b).join('\n'));
+    // building it on every line is quadratic on long documents.
+    // The lines are joined once per parseLines call (getJoined, above)
+    // and the remainder is sliced from it by line offset: the string
+    // handed to the regex is identical to lines.slice(i, b).join('\n'),
+    // so matches are unchanged, but a second '<'/'[' line does not
+    // re-join the rest.
+    const getRest = () => getJoined().slice(offsetCache[i - a]);
     // indented code
     {
-      if (/^(?: {4}[^\n]| {0,3}\t)/.test(line)) {
+      if (isIndentCodeStart(line)) {
       // bound the join to the end of the code block (a non-blank line
       // that is not indented code ends it)
       let end = i;
       while (end < b) {
         const l = lines[end];
-        if (/^(?: {4}[^\n]| {0,3}\t)/.test(l) || blankLine(l)) { end++; continue; }
+        if (isIndentCodeStart(l) || blankLine(l)) { end++; continue; }
         break;
       }
       const cap = RE_INDENT_CODE.exec(lines.slice(i, end).join('\n'));
@@ -746,7 +810,9 @@ function parseList(lines, i, b, links) {
     const itemStartLine = j;
     const firstLineRaw = cap[2].split('\n', 1)[0];
     const bulletIndent = cap[1].length;
-    let line = firstLineRaw.replace(/^[ \t]+/, (w) => expandTabs(w, bulletIndent));
+    let lw = 0;
+    while (lw < firstLineRaw.length && (firstLineRaw[lw] === ' ' || firstLineRaw[lw] === '\t')) lw++;
+    let line = lw ? expandTabs(firstLineRaw.slice(0, lw), bulletIndent) + firstLineRaw.slice(lw) : firstLineRaw;
     let nextLineStr = j + 1 < b ? lines[j + 1] : '';
     let blankLineFlag = !line.trim();
     let indent = 0;
@@ -754,8 +820,9 @@ function parseList(lines, i, b, links) {
     if (blankLineFlag) {
       indent = bulletIndent + 1;
     } else {
-      const m = /[^ ]/.exec(line);
-      indent = m ? m.index : 0;
+      let nsp = 0;
+      while (nsp < line.length && line[nsp] === ' ') nsp++;
+      indent = nsp < line.length ? nsp : 0;
       if (indent > 4) indent = 1;
       itemParts.push(line.slice(indent));
       indent += bulletIndent;
@@ -775,19 +842,30 @@ function parseList(lines, i, b, links) {
         let q = p;
         while (rawLine[q] === ' ' || rawLine[q] === '\t') q++;
         const isBlank = q >= rawLine.length;
-        const nlNoTabs = (rawLine[0] === ' ' || rawLine[0] === '\t') ? rawLine.replace(/^[ \t]+/, (w) => expandTabs(w)) : rawLine;
-        const nl = nlNoTabs;
+        let lead = 0;
+        while (lead < rawLine.length && (rawLine[lead] === ' ' || rawLine[lead] === '\t')) lead++;
+        const nlNoTabs = lead ? expandTabs(rawLine.slice(0, lead)) + rawLine.slice(lead) : rawLine;
         if (listLineBreaks(rawLine, res, effIndent, true)) break;
         // first non-space char of the expanded line, for the indent test
         let ns = 0;
         while (nlNoTabs[ns] === ' ') ns++;
         const nonSpace = ns >= nlNoTabs.length ? -1 : ns;
+        const dedented = nlNoTabs.slice(indent);
         if (nonSpace >= indent || isBlank) {
-          itemParts.push(nlNoTabs.slice(indent));
+          itemParts.push(dedented);
         } else {
           if (blankLineFlag) break;
-          const prev = line.replace(/\t/g, '    ');
-          if (prev.search(/[^ ]/) >= 4) break;
+          // first non-space char of the previous line, counting each tab
+          // as 4 spaces (as line.replace(/\t/g, '    ') did); -1 if none
+          let prevIdx = 0, pk = 0;
+          while (pk < line.length) {
+            const c = line[pk];
+            if (c === ' ') prevIdx++;
+            else if (c === '\t') prevIdx += 4;
+            else break;
+            pk++;
+          }
+          if (pk < line.length && prevIdx >= 4) break;
           if (listLineBreaks(line, res, effIndent, false)) break;
           let cont = rawLine;
           if (/^ {0,3}(?:=+|-+) *$/.test(rawLine)) {
@@ -802,16 +880,14 @@ function parseList(lines, i, b, links) {
         }
         blankLineFlag = isBlank;
         cur++;
-        line = nlNoTabs.slice(indent);
+        line = dedented;
       }
     }
-    const rawLines = lines.slice(itemStartLine, cur);
-    const rawText = rawLines.join('\n');
     if (!loose) {
       if (endsBlank) loose = true;
-      else if (/\n[ \t]*\n[ \t]*$/.test(rawText + '\n')) endsBlank = true;
+      else if (cur > itemStartLine && blankLine(lines[cur - 1])) endsBlank = true;
     }
-    items.push({ text: itemParts.join('\n'), raw: rawText, task: false, nodes: null, checked: false });
+    items.push({ text: itemParts.join('\n'), task: false, nodes: null, checked: false });
     j = cur;
     listRawLines = j - i;
     if (j >= b) break;
@@ -823,8 +899,7 @@ function parseList(lines, i, b, links) {
   }
   if (!items.length) return null;
   const lastItem = items[items.length - 1];
-  lastItem.raw = lastItem.raw.replace(/\s+$/, '');
-  lastItem.text = lastItem.text.replace(/\s+$/, '');
+  lastItem.text = lastItem.text.trimEnd();
   // tokenize items
   for (const item of items) {
     const sub = item.text.split('\n');
@@ -880,13 +955,24 @@ const RE_DEL_R = new RegExp(
   + '|[\\s](~~?)(?!~)(?=[\\p{P}\\p{S}])'
   + '|(?!~)[\\p{P}\\p{S}](~~?)(?!~)(?=[\\p{P}\\p{S}])'
   + '|[^\\s\\p{P}\\p{S}](~~?)(?=[^\\s\\p{P}\\p{S}])', 'gu');
+const RE_EM_L_Y = stickyOf(RE_EM_L);
+const RE_DEL_L_Y = stickyOf(RE_DEL_L);
 const RE_REFLINK_SEARCH = /!?\[(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\`])*\\]|\\[\s\S]|[^\[\]\\`])*?\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?\]\[((?!\s*\])(?:\\[\s\S]|[^\[\]\\`]){1,999})\]|!?\[(?:(?!\s*\])(?:\\[\s\S]|[^\[\]\\`]){1,999})\](?:\[\])?(?!\\\()/g;
 const RE_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
 const RE_ANYPUNCT_OUTSIDE = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
 
+const MASK_NEEDED_RE = /[\[`<\\]/;
 function maskSrc(src, links) {
+  // All three masks only match '[', '`', '<' or '\\': with none of them
+  // present every pass is a no-op scan of the whole string, so one
+  // regex test replaces up to five indexOf scans.
+  if (!MASK_NEEDED_RE.test(src)) return src;
   let masked = src;
-  if (links && src.indexOf('[') >= 0) {
+  // the reflink mask can only change something when a link definition
+  // exists; with none it is a very expensive no-op scan
+  let hasDefs = false;
+  if (links) for (const _k in links) { hasDefs = true; break; }
+  if (hasDefs && src.indexOf('[') >= 0) {
     const maskReflink = (m0) => {
       const refStart = m0.lastIndexOf('[');
       if (!Object.prototype.hasOwnProperty.call(links, normLabel(m0.slice(refStart + 1, -1)))) return m0;
@@ -907,16 +993,52 @@ function maskSrc(src, links) {
     RE_REFLINK_SEARCH.lastIndex = 0;
     masked = masked.replace(RE_REFLINK_SEARCH, maskReflink);
   }
-  masked = masked.replace(RE_ANYPUNCT_OUTSIDE, (m0, code, punct) => {
-    if (punct) return '+'.repeat(m0.length);
-    if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
-    return m0;
-  });
-  masked = masked.replace(RE_BLOCKSKIP, (m0, _l, ctx) => {
-    const off = ctx ? ctx.length : 0;
-    return m0.slice(0, off) + '[' + 'a'.repeat(Math.max(0, m0.length - off - 2)) + ']';
-  });
+  // RE_ANYPUNCT_OUTSIDE only matches code spans (`) or escaped punct (\\):
+  // with neither present the replace is a no-op scan of the whole string
+  if (masked.indexOf('`') >= 0 || masked.indexOf('\\') >= 0) {
+    masked = masked.replace(RE_ANYPUNCT_OUTSIDE, (m0, code, punct) => {
+      if (punct) return '+'.repeat(m0.length);
+      if (code) return code + m0.slice(code.length, -code.length).replace(/`/g, '+') + code;
+      return m0;
+    });
+  }
+  // RE_BLOCKSKIP only matches '[...](...)', code spans or '<...>' tags
+  if (masked.indexOf('[') >= 0 || masked.indexOf('`') >= 0 || masked.indexOf('<') >= 0) {
+    masked = masked.replace(RE_BLOCKSKIP, (m0, _l, ctx) => {
+      const off = ctx ? ctx.length : 0;
+      return m0.slice(0, off) + '[' + 'a'.repeat(Math.max(0, m0.length - off - 2)) + ']';
+    });
+  }
   return masked;
+}
+// Last closer positions for '*', '_' and '~' in one scan, cached per
+// masked string on the inline context: tryEmphasis/tryDel used to rescan
+// the whole masked string on every delimiter attempt (quadratic on long
+// paragraphs). The cache is keyed by string content, so a nested
+// inlineRender that overwrites it simply causes a recompute on return.
+function lastClosers(masked) {
+  let star = -1, und = -1, tilde = -1;
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch !== '*' && ch !== '_' && ch !== '~') continue;
+    const prev = i === 0 ? '\n' : masked[i - 1];
+    let j = i + 1;
+    while (j < masked.length && masked[j] === ch) j++;
+    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
+      if (ch === '*') star = i;
+      else if (ch === '_') und = i;
+      else tilde = i;
+    }
+    i = j - 1;
+  }
+  return { star, und, tilde };
+}
+function lastCloserCached(ctx, masked, delim) {
+  if (ctx._lcMask !== masked) {
+    ctx._lcMask = masked;
+    ctx._lc = lastClosers(masked);
+  }
+  return delim === '*' ? ctx._lc.star : delim === '_' ? ctx._lc.und : ctx._lc.tilde;
 }
 function lastCloserIndex(masked, delim) {
   let last = -1;
@@ -937,23 +1059,32 @@ function lastCloserIndex(masked, delim) {
 // Inline rendering context, shared across one inline run.
 function makeCtx() { return { inLink: false, inRawBlock: false, linkEmitted: false, parenPossible: true }; }
 
+// Any inline construct at all: escapes, tags, links, emphasis, code,
+// hard breaks, autolinks (incl. case-insensitive protocols) and '@'
+// (possible email autolink). A string with none of these is plain text.
+const FAST_INLINE_RE = /[\\<\[*_`~@]|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:| {2,}\n/i;
+
 function inlineRender(src, links, ctx, plain) {
   if (!src) return '';
+  // Fast path: plain text only -- no escaping beyond entities, no
+  // emphasis/links to resolve, and no ctx state to change (no tryLink
+  // runs, so parenPossible is untouched, as the slow path restores it)
+  if (!FAST_INLINE_RE.test(src)) {
+    if (plain || ctx.inRawBlock) return src;
+    return escNoEncode(decodeNumeric(src));
+  }
   const masked = (src.indexOf('*') >= 0 || src.indexOf('_') >= 0 || src.indexOf('~') >= 0) ? maskSrc(src, links) : src;
   const prevParen = ctx.parenPossible;
   ctx.parenPossible = prevParen && src.indexOf(')') >= 0;
   let out = '';
   let i = 0;
-  let prevChar = '';
-  let keepPrev = false;
   const n = src.length;
   while (i < n) {
-    if (!keepPrev) prevChar = '';
-    keepPrev = false;
     const ch = src[i];
     // escape
     if (ch === '\\') {
-      const m = execAt(RE_ESCAPE_Y, src, i);
+      RE_ESCAPE_Y.lastIndex = i;
+      const m = RE_ESCAPE_Y.exec(src);
       if (m) {
         out += plain ? m[1] : escNoEncode(m[1]);
         i += m[0].length;
@@ -962,7 +1093,8 @@ function inlineRender(src, links, ctx, plain) {
     }
     // tag
     if (ch === '<') {
-      const m = execAt(RE_TAG_Y, src, i);
+      RE_TAG_Y.lastIndex = i;
+      const m = RE_TAG_Y.exec(src);
       if (m) {
         const tagText = m[0];
         if (!ctx.inLink && /^<a /i.test(tagText)) ctx.inLink = true;
@@ -996,7 +1128,8 @@ function inlineRender(src, links, ctx, plain) {
     }
     // code span
     if (ch === '`') {
-      const m = execAt(RE_CODE_Y, src, i);
+      RE_CODE_Y.lastIndex = i;
+      const m = RE_CODE_Y.exec(src);
       if (m) {
         let text = m[2].replace(/\n/g, ' ');
         const hasNon = /[^ ]/.test(text);
@@ -1009,7 +1142,8 @@ function inlineRender(src, links, ctx, plain) {
     }
     // hard break
     if (ch === ' ' || ch === '\\') {
-      const m = execAt(RE_BR_Y, src, i);
+      RE_BR_Y.lastIndex = i;
+      const m = RE_BR_Y.exec(src);
       if (m) { out += plain ? '' : '<br>'; i += m[0].length; continue; }
     }
     // strikethrough
@@ -1019,7 +1153,8 @@ function inlineRender(src, links, ctx, plain) {
     }
     // autolink
     if (ch === '<') {
-      const m = execAt(RE_AUTOLINK_Y, src, i);
+      RE_AUTOLINK_Y.lastIndex = i;
+      const m = RE_AUTOLINK_Y.exec(src);
       if (m) {
         const text = m[1];
         const isEmail = !/^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:/.test(text);
@@ -1038,7 +1173,8 @@ function inlineRender(src, links, ctx, plain) {
     }
     // extended autolink (www / email / protocol)
     if (!ctx.inLink && !plain) {
-      const m = execAt(RE_URL_Y, src, i);
+      RE_URL_Y.lastIndex = i;
+      const m = RE_URL_Y.exec(src);
       if (m) {
         let text, href;
         if (m[2] === '@') { text = m[0]; href = 'mailto:' + text; }
@@ -1069,8 +1205,6 @@ function inlineRender(src, links, ctx, plain) {
     if (plain) out += chunk;
     else if (ctx.inRawBlock) out += chunk;
     else out += escNoEncode(decodeNumeric(chunk));
-    if (chunk[chunk.length - 1] !== '_') prevChar = chunk[chunk.length - 1];
-    keepPrev = true;
   }
   ctx.parenPossible = prevParen;
   return out;
@@ -1087,71 +1221,100 @@ function isEmailWordChar(c) {
 function isWwwPrev(c) {
   return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v' || c === '*' || c === '_' || c === '~' || c === '(';
 }
-function startsWithCI(s, i, word) {
+const RE_EMAIL_DOM = /^[a-zA-Z0-9\-_]+(?:\.[a-zA-Z0-9\-_]*[a-zA-Z0-9])+/;
+const SCAN_SPECIAL_RE = /[`\\<\[*!_~]/g;
+
+// Case-insensitive word match at s[i..i+word.length)
+function ciWord(s, i, word) {
+  if (i < 0) return false;
   for (let k = 0; k < word.length; k++) {
     if ((s.charCodeAt(i + k) | 32) !== word.charCodeAt(k)) return false;
   }
   return true;
 }
-function isEmailWord(w) {
-  if (!w) return false;
-  for (let k = 0; k < w.length; k++) if (!isEmailWordChar(w[k])) return false;
-  return true;
+// Earliest protocol-prefix start in s[j..end), or -1. A regex search
+// for the prefixes scans the whole remainder on every text chunk; every
+// prefix holds a ':', so scanning ':' positions and checking the word
+// before it (and '://' after it) finds the same starts with far less
+// work. No boundary check, as the old loop had none.
+function protoStart(s, j, end) {
+  let best = -1;
+  let colon = s.indexOf(':', j);
+  while (colon !== -1 && colon < end) {
+    let st = -1;
+    if (s[colon + 1] === '/' && s[colon + 2] === '/') {
+      if (ciWord(s, colon - 5, 'https')) st = colon - 5;
+      else if (ciWord(s, colon - 4, 'http')) st = colon - 4;
+      else if (ciWord(s, colon - 3, 'ftp')) st = colon - 3;
+    } else {
+      if (ciWord(s, colon - 6, 'mailto')) st = colon - 6;
+      else if (ciWord(s, colon - 4, 'xmpp')) st = colon - 4;
+    }
+    if (st >= j && (best === -1 || st < best)) best = st;
+    colon = s.indexOf(':', colon + 1);
+  }
+  return best;
 }
-const RE_EMAIL_DOM = /^[a-zA-Z0-9\-_]+(?:\.[a-zA-Z0-9\-_]*[a-zA-Z0-9])+/;
 
+// End of the text chunk starting at i: the earliest position where the
+// old per-character loop would have stopped, found with native searches
+// instead of one JS step per character. The break conditions are the
+// same as the loop's: a special character; a run of 2+ spaces before a
+// newline (hard break, at the run's first space); a www. autolink at a
+// word boundary; a protocol prefix (no boundary check, as the loop had
+// none); or an email word@domain whose word starts at a word boundary
+// with an alphanumeric character, '@' within 64 chars of it.
 function scanText(s, i, ctx, plain) {
   const n = s.length;
   let j = i;
-  while (j < n) {
+  if (j < n && (s[j] === '`' || s[j] === '~')) {
+    // a text chunk may start with a run of backticks/tildes (marked's
+    // inline text regex allows that as its first character); the next
+    // run of the same character ends the chunk instead
     const c = s[j];
-    if (j === i && (c === '`' || c === '~')) {
-      // a text chunk may start with a run of backticks/tildes (marked's
-      // inline text regex allows that as its first character); the next
-      // run of the same character ends the chunk instead
-      while (j < n && s[j] === c) j++;
-      continue;
-    }
-    if (c === '`' || c === '\\' || c === '<' || c === '[' || c === '*' || c === '~') break;
-    if (c === '!') break;
-    if (c === '_') break;
-    // hard break: two or more spaces before a newline
-    if (c === ' ' && j + 1 < n && s[j + 1] === ' ') {
-      let k = j;
-      while (k < n && s[k] === ' ') k++;
-      if (s[k] === '\n') break;
-      j = k;
-      continue;
-    }
-    if (!ctx.inLink && !plain) {
-      const c0 = s[j];
-      if (c0 === 'w' && s.startsWith('www.', j) && (j === 0 || isWwwPrev(s[j - 1]))) break;
-      // protocol prefixes, compared case-insensitively without allocating;
-      // gated on the first character so the helper rarely runs
-      if (c0 === 'h' || c0 === 'H') {
-        if (startsWithCI(s, j, 'http://') || startsWithCI(s, j, 'https://')) break;
-      } else if (c0 === 'f' || c0 === 'F') {
-        if (startsWithCI(s, j, 'ftp://')) break;
-      } else if (c0 === 'm' || c0 === 'M') {
-        if (startsWithCI(s, j, 'mailto:')) break;
-      } else if (c0 === 'x' || c0 === 'X') {
-        if (startsWithCI(s, j, 'xmpp:')) break;
-      }
-      // email start: word boundary + word@domain
-      if (isAlnumChar(c0) && (j === 0 || !isEmailWordChar(s[j - 1]))) {
-        const at = s.indexOf('@', j, Math.min(n, j + 64));
-        if (at > j) {
-          const word = s.slice(j, at);
-          if (isEmailWord(word)) {
-            const dom = s.slice(at + 1, at + 129);
-            if (RE_EMAIL_DOM.test(dom)) break;
-          }
-        }
-      }
-    }
-    j++;
+    while (j < n && s[j] === c) j++;
+    if (j >= n) return j;
   }
-  return j;
+  let end = n;
+  // one native scan for the next special character, instead of one
+  // indexOf scan per special character over the whole remainder
+  SCAN_SPECIAL_RE.lastIndex = j;
+  const sm = SCAN_SPECIAL_RE.exec(s);
+  if (sm) end = sm.index;
+  // The extended-autolink searches only matter inside this chunk:
+  // a www./protocol/hard-break start before `end` lies wholly before
+  // it (its characters are never special), so searching the chunk
+  // slice instead of the whole remainder is exact and far shorter.
+  // (Email is different: its word can start before `end` while its
+  // '@' lies past it, so it still searches the full string below.)
+  const sub = s.slice(j, end);
+  let q = sub.indexOf('  \n');
+  if (q !== -1) {
+    while (q > 0 && sub[q - 1] === ' ') q--;
+    if (j + q < end) end = j + q;
+  }
+  if (!ctx.inLink && !plain) {
+    let w = sub.indexOf('www.');
+    while (w !== -1) {
+      const wp = j + w;
+      if (wp === 0 || isWwwPrev(s[wp - 1])) { if (wp < end) end = wp; break; }
+      w = sub.indexOf('www.', w + 1);
+    }
+    const ps = protoStart(sub, 0, sub.length);
+    if (ps !== -1 && j + ps < end) end = j + ps;
+    let at = s.indexOf('@', j);
+    while (at !== -1) {
+      let ws = at;
+      while (ws > j && isEmailWordChar(s[ws - 1])) ws--;
+      const atWordStart = ws > j || ws === 0 || !isEmailWordChar(s[ws - 1]);
+      if (atWordStart && isAlnumChar(s[ws]) && at - ws <= 64) {
+        const dom = s.slice(at + 1, at + 129);
+        if (RE_EMAIL_DOM.test(dom)) { if (ws < end) end = ws; break; }
+      }
+      at = s.indexOf('@', at + 1);
+    }
+  }
+  return end;
 }
 
 function isLabelEndInside(src, label, labelStart) {
@@ -1183,8 +1346,7 @@ function renderLinkText(text, links, ctx, plain) {
 
 function tryLink(src, i, links, ctx, plain) {
   if (ctx.parenPossible === false) return null;
-  const sub = src.slice(i);
-  const cap = RE_LINK.exec(sub);
+  const cap = execAt(RE_LINK_Y, src, i);
   if (!cap) return null;
   const labelStart = cap[0][0] === '!' ? 2 : 1;
   if (isLabelEndInside(src, cap[1], i + labelStart)) return null;
@@ -1237,8 +1399,7 @@ function tryLink(src, i, links, ctx, plain) {
 }
 
 function tryRefLink(src, i, links, ctx, plain) {
-  const sub = src.slice(i);
-  let cap = RE_REFLINK.exec(sub) || RE_NOLINK.exec(sub);
+  let cap = execAt(RE_REFLINK_Y, src, i) || execAt(RE_NOLINK_Y, src, i);
   if (!cap) return null;
   const labelStart = cap[0][0] === '!' ? 2 : 1;
   if (isLabelEndInside(src, cap[1], i + labelStart)) return null;
@@ -1265,17 +1426,44 @@ function tryRefLink(src, i, links, ctx, plain) {
   return { html: out + '>' + r.html + '</a>', len: cap[0].length };
 }
 
+// Last code point ending at s[end-1..end) (a surrogate pair counts as one)
+function lastCpBefore(s, end) {
+  if (end <= 0) return '';
+  const lo = s.charCodeAt(end - 1);
+  if (lo >= 0xDC00 && lo <= 0xDFFF && end >= 2) {
+    const hi = s.charCodeAt(end - 2);
+    if (hi >= 0xD800 && hi <= 0xDBFF) return s.slice(end - 2, end);
+  }
+  return s[end - 1];
+}
+// UTF-16 length of the first code point of s (1, or 2 for a surrogate pair)
+function firstCpLen(s) {
+  const hi = s.charCodeAt(0);
+  return hi >= 0xD800 && hi <= 0xDBFF && s.length > 1 ? 2 : 1;
+}
+// [...s].length - 1 for a delimiter run (ASCII) plus one trailing char
+function runCpLenMinus1(s) {
+  const n = s.length;
+  if (n >= 2) {
+    const lo = s.charCodeAt(n - 1);
+    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+      const hi = s.charCodeAt(n - 2);
+      if (hi >= 0xD800 && hi <= 0xDBFF) return n - 2;
+    }
+  }
+  return n - 1;
+}
+
 function tryEmphasis(src, i, masked, links, ctx, plain) {
-  const sub = src.slice(i);
-  const match = RE_EM_L.exec(sub);
+  const match = execAt(RE_EM_L_Y, src, i);
   if (!match) return null;
   if (!match[1] && !match[2] && !match[3] && !match[4]) return null;
   const delim = match[0][0];
   const midRun = i > 0 && src[i - 1] === delim;
-  const srcStart = masked.length - sub.length;
+  const srcStart = i;
   let runStart = srcStart;
   while (runStart > 0 && masked[runStart - 1] === delim) runStart--;
-  const runPrev = runStart > 0 ? [...masked.slice(Math.max(0, runStart - 2), runStart)].at(-1) ?? '' : '';
+  const runPrev = runStart > 0 ? lastCpBefore(masked, runStart) : '';
   const runPrevPunct = runPrev === '*' || runPrev === '_' || isPunct(runPrev);
   let prevChar = i > 0 ? src[i - 1] : '';
   if (runStart < srcStart) prevChar = runPrev;
@@ -1283,14 +1471,14 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
   if (match[4] && isAlnum(prevChar)) return null;
   const nextChar = match[1] || match[3] || '';
   if (nextChar && prevChar && !prevPunct) return null;
-  const lLen = [...match[0]].length - 1;
+  const lLen = runCpLenMinus1(match[0]);
   const runLen = srcStart - runStart + lLen;
   const openerCanClose = !!runPrev.trim() && (!!nextChar || (delim === '*' && !runPrevPunct));
   const endRe = delim === '*' ? RE_EM_R_AST : RE_EM_R_UND;
-  const lastIdx = lastCloserIndex(masked, delim);
-  const windowStart = masked.length - sub.length + lLen;
+  const lastIdx = lastCloserCached(ctx, masked, delim);
+  const windowStart = i + lLen;
   if (lastIdx < windowStart) return null;
-  const windowMasked = masked.slice(-sub.length + lLen);
+  const windowMasked = masked.slice(windowStart);
   const lastInWindow = lastIdx - windowStart;
   endRe.lastIndex = 0;
   let delimTotal = lLen, midTotal = 0, m;
@@ -1298,7 +1486,7 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
     if (m.index > lastInWindow) break;
     const rDelim = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
     if (!rDelim) continue;
-    const rLen = [...rDelim].length;
+    const rLen = rDelim.length;
     if (m[3] || m[4]) { delimTotal += rLen; continue; }
     else if (m[5] || m[6] || openerCanClose) {
       if (midRun && (m[5] || m[6])) break;
@@ -1307,8 +1495,8 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
     delimTotal -= rLen;
     if (delimTotal > 0) continue;
     const used = Math.min(rLen, rLen + delimTotal + midTotal);
-    const firstLen = [...m[0]][0].length;
-    const raw = sub.slice(0, lLen + m.index + firstLen + used);
+    const firstLen = firstCpLen(m[0]);
+    const raw = src.slice(i, i + lLen + m.index + firstLen + used);
     const inner = raw.slice(1, -1);
     if (Math.min(lLen, used) % 2) {
       const html = plain ? inlineRender(inner, links, ctx, true) : '<em>' + inlineRender(inner, links, ctx, false) + '</em>';
@@ -1322,18 +1510,17 @@ function tryEmphasis(src, i, masked, links, ctx, plain) {
 }
 
 function tryDel(src, i, masked, links, ctx, plain) {
-  const sub = src.slice(i);
-  const match = RE_DEL_L.exec(sub);
+  const match = execAt(RE_DEL_L_Y, src, i);
   if (!match) return null;
   const nextChar = match[1] || '';
   const prevChar = i > 0 ? src[i - 1] : '';
   if (!nextChar || !prevChar || isPunct(prevChar)) {
-    const lLen = [...match[0]].length - 1;
+    const lLen = runCpLenMinus1(match[0]);
     let delimTotal = lLen;
-    const lastIdx = lastCloserIndex(masked, '~');
-    const windowStart = masked.length - sub.length + lLen;
+    const lastIdx = lastCloserCached(ctx, masked, '~');
+    const windowStart = i + lLen;
     if (lastIdx < windowStart) return null;
-    const windowMasked = masked.slice(-sub.length + lLen);
+    const windowMasked = masked.slice(windowStart);
     const lastInWindow = lastIdx - windowStart;
     RE_DEL_R.lastIndex = 0;
     let m;
@@ -1341,14 +1528,14 @@ function tryDel(src, i, masked, links, ctx, plain) {
       if (m.index > lastInWindow) break;
       const rDelim = m[1] || m[2] || m[3] || m[4] || m[5] || m[6];
       if (!rDelim) continue;
-      const rLen = [...rDelim].length;
+      const rLen = rDelim.length;
       if (rLen !== lLen) continue;
       if (m[3] || m[4]) { delimTotal += rLen; continue; }
       delimTotal -= rLen;
       if (delimTotal > 0) continue;
       const used = Math.min(rLen, rLen + delimTotal);
-      const firstLen = [...m[0]][0].length;
-      const raw = sub.slice(0, lLen + m.index + firstLen + used);
+      const firstLen = firstCpLen(m[0]);
+      const raw = src.slice(i, i + lLen + m.index + firstLen + used);
       const inner = raw.slice(lLen, -lLen);
       const html = plain ? inlineRender(inner, links, ctx, true) : '<del>' + inlineRender(inner, links, ctx, false) + '</del>';
       return { html, len: raw.length };
