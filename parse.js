@@ -800,7 +800,11 @@ function parseList(lines, i, b, links, first) {
         while (rawLine[p] === ' ') p++;
         let q = p;
         while (rawLine[q] === ' ' || rawLine[q] === '\t') q++;
-        const isBlank = rawLine.trim().length === 0;
+        // Blank = only spaces/tabs: q already scanned exactly that, so
+        // this avoids a trim() allocation on every list line. Lines are
+        // newline-free and \r-free here (parse() normalises \r first),
+        // matching blankLine's space/tab-only test.
+        const isBlank = q >= rawLine.length;
         const nlNoTabs = rawLine.indexOf('\t') >= 0 ? rawLine.replace(/^[ \t]+/, (w) => expandTabs(w)) : rawLine;
         if (listLineBreaks(rawLine, res, effIndent, true)) break;
         // first non-space char of the expanded line, for the indent test
@@ -1130,8 +1134,13 @@ function inlineRender(src, links, ctx, plain) {
 // is far slower than a code comparison when it runs on every character).
 // GFM text boundary grammar from marked 18.1.3 (MIT; see NOTICE).
 const RE_TEXT = /^(?:[^a-zA-Z0-9](?=(?:mailto|xmpp):)|(`+|~+|[^`~])(?:(?=[`~])|(?= {2,}\n)|(?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@)|[\s\S]*?(?:(?=[\\<!\[`*~_]|\b_|[hH][tT][tT][pP][sS]?|[fF][tT][pP]:\/\/|(?<![^\s*_~(])www\.|$)|[^ ](?= {2,}\n)|[^a-zA-Z0-9](?=(?:mailto|xmpp):)|[^a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-](?=[a-zA-Z0-9.!#$%&'*+\/=?_`{\|}~-]+@))))/;
+const RE_TEXT_Y = stickyOf(RE_TEXT);
 function scanText(s, i) {
-  return i + (RE_TEXT.exec(s.slice(i))?.[0].length || 0);
+  // Sticky match at the offset instead of slicing the remainder: the
+  // slice copied the whole rest of the paragraph on every text chunk.
+  RE_TEXT_Y.lastIndex = i;
+  const m = RE_TEXT_Y.exec(s);
+  return i + (m?.[0].length || 0);
 }
 
 function isLabelEndInside(src, label, labelStart) {
